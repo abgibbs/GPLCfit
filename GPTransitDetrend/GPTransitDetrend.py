@@ -85,6 +85,10 @@ idx = np.where(f_index == 0)[0]
 t,f = tall[idx],fall[idx]
 out_folder = args.ofolder
 
+# find separate nights, here assumed to be more then 0.4 days apart
+splitp=np.where(np.ediff1d(t)>0.4)[0][0]+1
+tnights = 2 # total number of nights
+
 eparamfilename = args.eparamfile
 eparams = args.eparamtouse
 data = np.genfromtxt(eparamfilename,unpack=True)
@@ -102,6 +106,9 @@ compfilename = args.compfile
 if compfilename is not None:
     comps = args.comptouse
     data = np.genfromtxt(compfilename,unpack=True)
+    if len(np.shape(data))==1:
+        print('\n Only 1 comparison... duplicating \n')
+        data = np.array([data,data])
     for i in range(len(data)):
         x = (data[i] - np.mean(data[i]))/np.sqrt(np.var(data[i]))
         if i == 0:
@@ -111,6 +118,10 @@ if compfilename is not None:
     if comps != 'all':
         idx_params = np.array(comps.split(',')).astype('int')
         Xc = Xc[idx_params,:]
+        
+# put data for separate nights into dictionary for individual access
+nights = {'n1': np.array([t[:splitp],f[:splitp],X[:,:splitp],Xc[:,:splitp]]),
+          'n2': np.array([t[splitp:],f[splitp:],X[:,splitp:],Xc[:,splitp:]])}
 
 # Extract limb-darkening law:
 ld_law = args.ldlaw
@@ -155,13 +166,22 @@ n_live_points = int(args.nlive)
 
 # Cook the george kernel:
 import george
-kernel = np.var(f)*george.kernels.ExpSquaredKernel(np.ones(X[:,idx].shape[0]),ndim=X[:,idx].shape[0],axes=range(X[:,idx].shape[0]))
+
+# Dimensions in number of parameters
 # Cook jitter term
 jitter = george.modeling.ConstantModel(np.log((200.*1e-6)**2.))
 
-# Wrap GP object to compute likelihood
-gp = george.GP(kernel, mean=0.0,fit_mean=False,white_noise=jitter,fit_white_noise=True)
-gp.compute(X[:,idx].T)
+# create dictionaries to store kernels and gp classes for individual nights
+kernels = {}
+gps = {}
+
+for key in nights:
+    kernels[key] = np.var(nights[key][1])*george.kernels.ExpSquaredKernel(np.ones(nights[key][2].shape[0]),ndim=(nights[key][2].shape[0]),axes=range(nights[key][2].shape[0]))
+    # Wrap GP object to compute likelihood
+    gps[key] = george.GP(kernels[key], mean=0.0,fit_mean=False,white_noise=jitter,fit_white_noise=True)
+
+gps['n1'].compute(nights['n1'][2].T)
+gps['n2'].compute(nights['n2'][2].T)
 
 # Define transit-related functions:
 def reverse_ld_coeffs(ld_law, q1, q2):
@@ -276,18 +296,20 @@ def prior(cube, ndim, nparams):
 
     # Prior on coefficients of comparison stars:
     if compfilename is not None:
-        for i in range(Xc.shape[0]):
-            cube[pcounter] = utils.transform_uniform(cube[pcounter],-10,10)
-            pcounter += 1
+        for key in nights:
+            for i in range(nights[key][3].shape[0]):
+                cube[pcounter] = utils.transform_uniform(cube[pcounter],-10,10)
+                pcounter += 1
 
     # Prior on kernel maximum variance; from 0.01 to 100 mmag: 
     cube[pcounter] = utils.transform_loguniform(cube[pcounter],(0.01*1e-3)**2,(100*1e-3)**2)
     pcounter = pcounter + 1
 
     # Now priors on the alphas = 1/lambdas; gamma(1,1) = exponential, same as Gibson+:
-    for i in range(X.shape[0]):
-        cube[pcounter] = utils.transform_exponential(cube[pcounter])
-        pcounter += 1    
+    for key in nights:
+        for i in range(nights[key][2].shape[0]):
+            cube[pcounter] = utils.transform_exponential(cube[pcounter])
+            pcounter += 1 
 
 def loglike(cube, ndim, nparams):
     # Evaluate the log-likelihood. For this, first extract all inputs:
@@ -331,41 +353,54 @@ def loglike(cube, ndim, nparams):
         lcmodel = m.light_curve(params)
 
     model = mmean - 2.51*np.log10(lcmodel)
+    models = {'n1': model[:splitp], 'n2': model[splitp:]} # split models into different nights
+    
     if compfilename is not None:
-        for i in range(Xc.shape[0]):
-            model = model + cube[pcounter]*Xc[i,idx]
-            pcounter += 1
+        for key in nights:
+            for i in range(nights[key][3].shape[0]):
+                models[key] = models[key] + cube[pcounter]*nights[key][3][i]
+                pcounter += 1
     max_var = cube[pcounter]
     pcounter = pcounter + 1
-    alphas = np.zeros(X.shape[0])
-    for i in range(X.shape[0]):
-        alphas[i] = cube[pcounter]
-        pcounter = pcounter + 1
-    gp_vector = np.append(np.append(ljitter,np.log(max_var)),np.log(1./alphas))
-    # Evaluate model:     
-    residuals = f - model
-    gp.set_parameter_vector(gp_vector)
-    return gp.log_likelihood(residuals)
+    
+    # create dictionaries for separate nights
+    alphas = {}
+    gp_vector = {}
+    residuals = {}
+    
+    for key in nights:
+        alphas[key] = np.zeros(nights[key][2].shape[0])
+        for i in range(nights[key][2].shape[0]):
+            alphas[key][i] = cube[pcounter]
+            pcounter = pcounter + 1
+        gp_vector[key] = np.append(np.append(ljitter,np.log(max_var)),np.log(1./alphas[key]))
+
+        # Evaluate model:
+        residuals[key] = nights[key][1] - models[key]
+        
+    gps['n1'].set_parameter_vector(gp_vector['n1'])
+    gps['n2'].set_parameter_vector(gp_vector['n2'])
+    return gps['n1'].log_likelihood(residuals['n1']) + gps['n2'].log_likelihood(residuals['n2'])
 
 #              v neparams   v max variance
-n_params = 8 + X.shape[0] + 1
+n_params = 8 + X.shape[0] * tnights + 1 # multiply for number of nights
 if compfilename is not None:
-    n_params +=  Xc.shape[0]
+    n_params +=  Xc.shape[0] * tnights
 if ld_law != 'linear':
     n_params += 1
 if not circular:
     n_params += 2
 
-print 'Number of external parameters:',X.shape[0]
-print 'Number of comparison stars:',Xc.shape[0]
-print 'Number of counted parameters:',n_params
+print('Number of external parameters:',X.shape[0]*tnights)
+print('Number of comparison stars:',Xc.shape[0]*tnights)
+print('Number of counted parameters:',n_params)
 out_file = out_folder+'out_multinest_trend_george_'
 
 import pickle
 # If not ran already, run MultiNest, save posterior samples and evidences to pickle file:
 if not os.path.exists(out_folder+'posteriors_trend_george.pkl'):
     # Run MultiNest:
-    pymultinest.run(loglike, prior, n_params, n_live_points = n_live_points,outputfiles_basename=out_file, resume = False, verbose = True)
+    #pymultinest.run(loglike, prior, n_params, n_live_points = n_live_points,outputfiles_basename=out_file, resume = False, verbose = True)
     # Get output:
     output = pymultinest.Analyzer(outputfiles_basename=out_file, n_params = n_params)
     # Get out parameters: this matrix has (samples,n_params+1):
@@ -373,7 +408,7 @@ if not os.path.exists(out_folder+'posteriors_trend_george.pkl'):
     # Extract parameters:
     mmean, ljitter,t0, P, p, a, b, q1  = posterior_samples[:,0],posterior_samples[:,1],posterior_samples[:,2],posterior_samples[:,3],\
                                          posterior_samples[:,4],posterior_samples[:,5],posterior_samples[:,6],posterior_samples[:,7]
-
+    
     a_lnZ = output.get_stats()['global evidence']
     out = {}
     out['posterior_samples'] = {}
@@ -401,33 +436,44 @@ if not os.path.exists(out_folder+'posteriors_trend_george.pkl'):
         out['posterior_samples']['omega'] = omega
         pcounter += 1
 
-    xc_coeffs = []
+    xc_coeffs = {}
     if compfilename is not None:
-        for i in range(Xc.shape[0]):
-            xc_coeffs.append(posterior_samples[:,pcounter])
-            out['posterior_samples']['xc'+str(i)] = posterior_samples[:,pcounter]
-            pcounter += 1
+        for key in nights: # splitting comparison and alpha saves into different nights
+            out['posterior_samples']['comps_'+key] = {}
+            xc_coeffs[key] = []
+            for i in range(Xc.shape[0]):
+                xc_coeffs[key].append(posterior_samples[:,pcounter])
+                out['posterior_samples']['comps_'+key]['xc'+str(i)] = posterior_samples[:,pcounter]
+                pcounter += 1
+             
     max_var = posterior_samples[:,pcounter]
     out['posterior_samples']['max_var'] = max_var
     pcounter = pcounter + 1
-    alphas = []
-    for i in range(X.shape[0]):
-        alphas.append(posterior_samples[:,pcounter])
-        out['posterior_samples']['alpha'+str(i)] = posterior_samples[:,pcounter]
-        pcounter = pcounter + 1
+    alphas = {}
+    for key in nights:
+        out['posterior_samples']['alphas_'+key] = {}
+        alphas[key] = []
+        for i in range(X.shape[0]):
+            alphas[key].append(posterior_samples[:,pcounter])
+            out['posterior_samples']['alphas_'+key]['alpha'+str(i)] = posterior_samples[:,pcounter]
+            pcounter = pcounter + 1
 
     out['lnZ'] = a_lnZ
     pickle.dump(out,open(out_folder+'posteriors_trend_george.pkl','wb'))
 else:
     out = pickle.load(open(out_folder+'posteriors_trend_george.pkl','rb'))
     posterior_samples = out['posterior_samples']['unnamed']
-
+    
 mmean,ljitter = np.median(out['posterior_samples']['mmean']),np.median(out['posterior_samples']['ljitter'])
 max_var = np.median(out['posterior_samples']['max_var'])
-alphas = np.zeros(X.shape[0])
-for i in range(X.shape[0]):
-    alphas[i] = np.median(out['posterior_samples']['alpha'+str(i)])
-gp_vector = np.append(np.append(ljitter,np.log(max_var)),np.log(1./alphas))
+alphas = {}
+gp_vector = {}
+for key in nights:
+    alphas[key] = np.zeros(X.shape[0])
+    for i in range(X.shape[0]):
+        alphas[key][i] = np.median(out['posterior_samples']['alphas_'+key]['alpha'+str(i)])
+    gp_vector[key] = np.append(np.append(ljitter,np.log(max_var)),np.log(1./alphas[key]))
+
 
 # Evaluate LC:
 t0, P, p, a, b, q1 = np.median(out['posterior_samples']['t0']),np.median(out['posterior_samples']['P']),\
@@ -469,82 +515,96 @@ else:
         lcmodel = m.light_curve(params)
 
 model = - 2.51*np.log10(lcmodel)
-comp_model = mmean
+models = {'n1': model[:splitp], 'n2': model[splitp:]} # added for comparing each night
+comp_models = {}
 if compfilename is not None:
-    for i in range(Xc.shape[0]):
-        comp_model = comp_model + np.median(out['posterior_samples']['xc'+str(i)])*Xc[i,idx]
-# Evaluate model:     
-residuals = f - model - comp_model
-gp.set_parameter_vector(gp_vector)
+    for key in nights:
+        comp_model = mmean
+        for i in range(Xc.shape[0]):
+            comp_model = comp_model + np.median(out['posterior_samples']['comps_'+key]['xc'+str(i)])*nights[key][3][i]#Xc[i,idx]
+            comp_models[key] = comp_model 
+
+# Evaluate model: 
+residuals = {}
+for key in nights:
+    residuals[key] = nights[key][1] - models[key] - comp_models[key]
+gps['n1'].set_parameter_vector(gp_vector['n1'])
+gps['n2'].set_parameter_vector(gp_vector['n2'])
 
 # Get prediction from GP:
-pred_mean, pred_var = gp.predict(residuals, X.T, return_var=True)
-pred_std = np.sqrt(pred_var)
-
+pred_mean = {}
+pred_var = {}
+pred_std = {}
+for key in nights:
+    pred_mean[key], pred_var[key] = gps[key].predict(residuals[key], nights[key][2].T, return_var=True)
+    pred_std[key] = np.sqrt(pred_var[key])
+    
 #if compfilename is not None:
 #    for i in range(Xc.shape[0]):
 #        model = model + cube[pcounter]*Xc[i,:]
 #        pcounter += 1
 
-fout,fout_err = exotoolbox.utils.mag_to_flux(fall-comp_model,np.ones(len(tall))*np.sqrt(np.exp(ljitter)))
-plt.errorbar(tall - int(tall[0]),fout,yerr=fout_err,fmt='.')
-pred_mean_f,fout_err = exotoolbox.utils.mag_to_flux(pred_mean,np.ones(len(tall))*np.sqrt(np.exp(ljitter)))
-plt.plot(tall - int(tall[0]),pred_mean_f)
+# PLOTTING ---------------------------------------------------------------------------------------
+
+# Plot 1 - Raw LC w/ GP model
+
+f, axarr = plt.subplots(tnights, sharey='row')
+
+fout = {}
+fout_err = {}
+for key in nights:
+    fout[key],fout_err[key] = exotoolbox.utils.mag_to_flux(nights[key][1]-comp_models[key],np.ones(len(nights[key][0]))*np.sqrt(np.exp(ljitter)))
+    
+axarr[0].errorbar(nights['n1'][0] - int(nights['n1'][0][0]),fout['n1'],yerr=fout_err['n1'],fmt='.')
+axarr[1].errorbar(nights['n2'][0] - int(nights['n2'][0][0]),fout['n2'],yerr=fout_err['n2'],fmt='.')
+
+pred_mean_f = {}
+for key in nights:
+    pred_mean_f[key],fout_err[key] = exotoolbox.utils.mag_to_flux(pred_mean[key],np.ones(len(nights[key][0]))*np.sqrt(np.exp(ljitter)))
+
+axarr[0].plot(nights['n1'][0] - int(nights['n1'][0][0]),pred_mean_f['n1'])
+axarr[1].plot(nights['n2'][0] - int(nights['n2'][0][0]),pred_mean_f['n2'])
+
 plt.show()
-fall = fall - comp_model - pred_mean
-#plt.errorbar(tall,fall,yerr=np.ones(len(tall))*np.sqrt(np.exp(ljitter)),fmt='.')
-#plt.show()
-plt.errorbar(tall - int(tall[0]),fall,yerr=np.ones(len(tall))*np.sqrt(np.exp(ljitter)),fmt='.')
+
+# Plot 2 - Residuals
+
+f, axarr = plt.subplots(tnights, sharey='row')
+
+nights['n1'][1] = nights['n1'][1] - comp_models['n1'] - pred_mean['n1']
+nights['n2'][1] = nights['n2'][1] - comp_models['n2'] - pred_mean['n2']
+
+axarr[0].errorbar(nights['n1'][0] - int(nights['n1'][0][0]),nights['n1'][1],yerr=np.ones(len(nights['n1'][0]))*np.sqrt(np.exp(ljitter)),fmt='.')
+axarr[1].errorbar(nights['n2'][0] - int(nights['n2'][0][0]),nights['n2'][1],yerr=np.ones(len(nights['n2'][0]))*np.sqrt(np.exp(ljitter)),fmt='.')
+
 plt.show()
-fout,fout_err = exotoolbox.utils.mag_to_flux(fall,np.ones(len(tall))*np.sqrt(np.exp(ljitter)))
+
+# Plot 3 - Detrend LC w/ transit model
+
+f, axarr = plt.subplots(tnights, sharey='row')
+
+for key in nights:
+    fout[key],fout_err[key] = exotoolbox.utils.mag_to_flux(nights[key][1],np.ones(len(nights[key][0]))*np.sqrt(np.exp(ljitter)))
+    
+'''
 fileout = open('detrended_lc.dat','w')
 for i in range(len(tall)):
     fileout.write('{0:.10f} {1:.10f} {2:.10f} {3:.10f}\n'.format(tall[i],fout[i],fout_err[i],lcmodel[i]))
 fileout.close()
-plt.errorbar(tall - int(tall[0]),fout,yerr=fout_err,fmt='.')
-plt.plot(tall - int(tall[0]),lcmodel,'r-')
-plt.xlabel('Time (BJD - '+str(int(tall[0]))+')')
-plt.ylabel('Relative flux')
+'''
+
+axarr[0].errorbar(nights['n1'][0] - int(nights['n1'][0][0]),fout['n1'],yerr=fout_err['n1'],fmt='.')
+axarr[1].errorbar(nights['n2'][0] - int(nights['n2'][0][0]),fout['n2'],yerr=fout_err['n2'],fmt='.')
+
+axarr[0].plot(nights['n1'][0] - int(nights['n1'][0][0]),lcmodel[:splitp],'b-')
+axarr[1].plot(nights['n2'][0] - int(nights['n2'][0][0]),lcmodel[splitp:],'b-')
+
+axarr[0].set_xlabel('Time (BJD - '+str(int(nights['n1'][0][0]))+')')
+axarr[1].set_xlabel('Time (BJD - '+str(int(nights['n2'][0][0]))+')')
+
+axarr[0].set_ylabel('Relative flux')
+
+plt.subplots_adjust(hspace=0.75)
+
 plt.show()
-"""
-# Plot:
-sns.set_context("talk")
-sns.set_style("ticks")
-#matplotlib.rcParams['mathtext.fontset'] = 'stix'
-matplotlib.rcParams['font.family'] = 'sans-serif'
-matplotlib.rcParams['font.sans-serif'] = ['Arial']
-matplotlib.rcParams['font.size'] = 12
-matplotlib.rcParams['legend.fontsize'] = 10
-matplotlib.rcParams['axes.linewidth'] = 1.2 
-matplotlib.rcParams['xtick.direction'] = 'out'
-matplotlib.rcParams['ytick.direction'] = 'out'
-matplotlib.rcParams['lines.markeredgewidth'] = 1 
-fig = plt.figure(figsize=(10,4.5))
-gs = matplotlib.gridspec.GridSpec(2, 1, height_ratios=[3, 1])
 
-tzero = int(t[0])
-# Plot MAP solution:
-ax = plt.subplot(gs[0])
-color = "cornflowerblue"
-plt.plot(t-tzero, f,".k",markersize=1,label='K2 data')
-plt.plot(t-tzero, pred_mean + mmean + model, linewidth=1, color='red',label='GP',alpha=0.5)
-#plt.np.min(t-tzero)-0.1,np.max(t-tzero)+0.1
-#plt.xlim(np.min(t-tzero)-0.1,np.max(t-tzero)+0.1)
-#plt.plot([10.,1],[np.max(pred_mean+mmean),0.995],'black',linewidth=1,alpha=0.5)
-#plt.plot([11.,22.],[np.max(pred_mean+mmean),0.995],'black',linewidth=1,alpha=0.5)
-plt.ylabel('Relative flux')
-plt.legend(loc='lower right')
-
-# Get prediction from GP to get residuals:
-ax = plt.subplot(gs[1])
-pred_mean, pred_var = gp.predict((f-mmean-model), X.T, return_var=True)
-#plt.errorbar(t, (f-theta[0]-pred_mean)*1e6, yerr=ferr*1e6, fmt=".k",label='K2 data',markersize=1,alpha=0.1)
-plt.plot(t-tzero,(f-mmean - model - pred_mean)*1e6,'.k',markersize=1)
-print 'rms:',np.sqrt(np.var((f-mmean-pred_mean)*1e6))
-print 'med error:',np.median(ferr*1e6)
-plt.xlabel('Time (BJD-'+str(tzero)+')')
-plt.ylabel('Residuals')
-#plt.xlim(np.min(t-tzero)-0.1,np.max(t-tzero)+0.1)
-plt.tight_layout()
-plt.savefig(out_folder+'GP_fit_george.pdf')
-"""
